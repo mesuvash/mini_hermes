@@ -29,7 +29,7 @@ class Agent:
         self.client = client
         self.model = model
         self.system_prompt = system_prompt  # frozen per session
-        self.tools = tools
+        self.tools = tools                  # fallback if no registry set
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
         self.messages: list[dict] = [
@@ -39,7 +39,11 @@ class Agent:
         # Tool-calling strategy (structured vs text-based)
         self._strategy: ToolCallingStrategy = strategy_for_model(model)
 
-        # Tool handlers -- set externally
+        # Tool registry -- if set, schemas and handlers are read live
+        # so newly created tools are available immediately.
+        self._registry = None
+
+        # Tool handlers -- used as fallback if no registry set
         self._tool_handlers: dict = {}
 
         # Session DB -- set externally
@@ -53,9 +57,18 @@ class Agent:
         self._iters_since_skill = 0
         self._user_turn_count = 0
 
+        # Abort flag — set by CLI when user presses ESC
+        self._abort = False
+
         # Compression (Chapter 14)
         self._compressor = None  # set via set_compressor()
         self._enable_prompt_caching = False  # set via configure_caching()
+
+    def set_registry(self, registry):
+        """Set the tool registry for live schema/handler lookups.
+        When set, newly registered tools (e.g. via create_tool) are
+        available to the LLM on the very next turn."""
+        self._registry = registry
 
     def set_handlers(self, handlers: dict):
         self._tool_handlers = handlers
@@ -91,9 +104,15 @@ class Agent:
         self._persist_message("user", user_input)
 
         # Agent loop
+        self._abort = False
         tool_iters_this_turn = 0
         for i in range(self.max_iterations):
+            if self._abort:
+                return "[Cancelled]"
+
             response = self._call_llm()
+            if self._abort:
+                return "[Cancelled]"
             if response is None:
                 return "[Error: LLM call failed]"
 
@@ -117,6 +136,9 @@ class Agent:
             self._iters_since_skill += 1
 
             for tc in tool_calls:
+                if self._abort:
+                    break
+
                 # Reset nudge counter if agent uses the tool voluntarily
                 if tc.name == "memory":
                     self._turns_since_memory = 0
@@ -158,7 +180,7 @@ class Agent:
                 threshold = self._compressor.max_context_tokens * self._compressor.THRESHOLD
                 if est >= threshold:
                     # Flush memories before compression (user-role sentinel)
-                    from compression import flush_memories
+                    from context_compression import flush_memories
                     flush_memories(self, self.messages)
                     self.messages = self._compressor.maybe_compress(self.messages)
 
@@ -176,8 +198,10 @@ class Agent:
                 "max_tokens": self.max_tokens,
             }
             # Strategy decides whether to pass tools as API param
-            # or inject them into the system prompt
-            kwargs = self._strategy.prepare_kwargs(kwargs, self.tools)
+            # or inject them into the system prompt.
+            # Read live from registry so newly created tools appear immediately.
+            tools = self._registry.get_schemas() if self._registry else self.tools
+            kwargs = self._strategy.prepare_kwargs(kwargs, tools)
 
             return self.client.chat.completions.create(**kwargs)
         except Exception as e:
@@ -204,7 +228,12 @@ class Agent:
         return api_msgs
 
     def _execute_tool(self, name: str, args: dict) -> str:
-        handler = self._tool_handlers.get(name)
+        # Look up live from registry (picks up newly created tools),
+        # fall back to static handlers dict for backward compat.
+        if self._registry:
+            handler = self._registry.get_handlers().get(name)
+        else:
+            handler = self._tool_handlers.get(name)
         if not handler:
             return f"Error: unknown tool '{name}'"
         try:
