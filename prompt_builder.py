@@ -55,4 +55,15 @@ skills exist, and skill_view to load their full content when relevant."""
     TOOL_USE_GUIDANCE = """## Tool Use
 Take action. Don't just describe what you would do -- actually do it. \
 If the user asks you to write code, write the file. If they ask you \
-to run something, run it. Prefer action over explanation."""
+to run something, run it. Prefer action over explanation.
+
+## Creating New Tools
+You can create new callable tools using create_tool. When the user asks \
+for a new capability (web scraper, API integration, data fetcher, etc.):
+1. Design the tool: name, description, parameters, and Python handler code.
+2. Call create_tool with the implementation. It registers and auto-tests the tool.
+3. ALWAYS show the test result to the user and ask them to verify it looks correct.
+4. If the test failed or the user is unhappy, fix it with update_tool or remove with delete_tool.
+5. Only consider the task done after the user confirms the tool works.
+Custom tools persist across sessions (stored in data/custom_tools/).
+Use list_custom_tools to see existing ones, update_tool to modify, delete_tool to remove."""

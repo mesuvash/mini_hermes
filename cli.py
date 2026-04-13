@@ -3,6 +3,7 @@
 Mini-Hermes CLI (Chapter 15)
 
 Terminal interface that wires all components together:
+- Interactive prompt with history, arrow keys, auto-suggest
 - Frozen system prompt built once at session start
 - SQLite + FTS5 session persistence
 - Persistent memory (MEMORY.md / USER.md)
@@ -11,12 +12,21 @@ Terminal interface that wires all components together:
 """
 
 import sys
+import select
+import termios
+import threading
+import tty
 import yaml
 import logging
 from pick import pick
 from pathlib import Path
 from openai import OpenAI
 from tool_calling import strategy_for_model
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.formatted_text import HTML
 
 # Ensure mini_hermes directory is on path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -28,16 +38,57 @@ from memory.session_db import SessionDB
 from memory.persistent import PersistentMemory
 from memory.recall import SessionRecall
 from skills.loader import SkillLoader
-from compression import ContextCompressor
+from context_compression import ContextCompressor
 
 # Import tool modules to trigger registration
 import tools.terminal
 import tools.file_tools
 import tools.memory_tool
+import tools.tool_creator
+import tools.introspect
+import tools.lmstudio_logs
 import skills.manager
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("mini-hermes")
+
+
+def _run_with_esc(agent, user_input: str) -> str:
+    """Run agent in a background thread. Press ESC to cancel."""
+    result = [None]
+    error = [None]
+
+    def _target():
+        try:
+            result[0] = agent.run(user_input)
+        except Exception as e:
+            error[0] = e
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+
+    # Save terminal settings and switch to raw mode to detect ESC
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)  # cbreak: read char-by-char, no echo
+        while thread.is_alive():
+            thread.join(timeout=0.1)
+            # Check for keypress without blocking
+            if select.select([sys.stdin], [], [], 0)[0]:
+                ch = sys.stdin.read(1)
+                if ch == '\x1b':  # ESC
+                    agent._abort = True
+                    # Wait briefly for thread to notice
+                    thread.join(timeout=2.0)
+                    return "[Cancelled]"
+    finally:
+        # Restore terminal to normal mode
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    if error[0]:
+        return f"[Error: {error[0]}]"
+    return result[0]
 
 
 def main():
@@ -75,6 +126,11 @@ def main():
     tools.memory_tool.set_memory(persistent, recall)
     skills.manager.set_skill_loader(skill_loader, skills_dir)
 
+    # Wire custom tool creator + load existing custom tools
+    custom_tools_dir = data_dir / "custom_tools"
+    tools.tool_creator.set_custom_tools_dir(custom_tools_dir)
+    custom_tool_count = tools.tool_creator.load_custom_tools()
+
     # ── Build system prompt ONCE (frozen snapshot) ──
     builder = PromptBuilder()
     system_prompt = builder.build(
@@ -96,6 +152,7 @@ def main():
         max_iterations=config.get("agent", {}).get("max_iterations", 15),
         max_tokens=max_tokens,
     )
+    agent.set_registry(registry)
     agent.set_handlers(registry.get_handlers())
     agent.session_db = session_db
     agent.session_id = session_id
@@ -115,22 +172,31 @@ def main():
     )
     agent.set_compressor(compressor)
 
+    # ── Interactive prompt with history ──
+    history_file = data_dir / ".prompt_history"
+    session = PromptSession(
+        history=FileHistory(str(history_file)),
+        auto_suggest=AutoSuggestFromHistory(),
+        enable_history_search=True,  # Ctrl-R reverse search
+    )
+
     # ── REPL ──
     print("╔══════════════════════════════════════╗")
     print("║       Mini-Hermes Agent v0.1         ║")
-    print("║  /mem /skills /model /sessions       ║")
-    print("║  exit to quit                        ║")
+    print("║  /help for commands                  ║")
     print("╚══════════════════════════════════════╝")
     print(f"  Model: {model}")
     print(f"  Session: {session_id[:8]}...")
     mem_status = "loaded" if persistent.load() else "empty"
     skill_count = len(skill_loader.load_all())
-    print(f"  Memory: {mem_status} | Skills: {skill_count}")
+    print(f"  Memory: {mem_status} | Skills: {skill_count} | Custom Tools: {custom_tool_count}")
     print()
 
     while True:
         try:
-            user_input = input("\033[1;32myou >\033[0m ").strip()
+            user_input = session.prompt(
+                HTML("<ansigreen><b>you &gt;</b></ansigreen> ")
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
@@ -143,6 +209,44 @@ def main():
             break
 
         # Slash commands
+        if user_input == "/help":
+            print("\n\033[1;33m── Commands ──\033[0m")
+            print("  /help       Show this help message")
+            print("  /clear      Clear conversation context (start fresh)")
+            print("  /mem        Show persistent memory and user profile")
+            print("  /skills     List learned skills")
+            print("  /model      Switch between available models")
+            print("  /sessions   Search past sessions by keyword")
+            print("  /tools      List all registered tools")
+            print("  exit        Quit and save session")
+            print()
+            print("\033[1;33m── Shortcuts ──\033[0m")
+            print("  ESC         Cancel ongoing request")
+            print("  ↑/↓         Navigate command history")
+            print("  Ctrl-R      Reverse search history")
+            print("  Ctrl-A/E    Jump to start/end of line")
+            print("  Tab         Accept auto-suggestion")
+            print()
+            continue
+
+        if user_input == "/clear":
+            # Reset conversation to just the system prompt
+            agent.messages = [
+                {"role": "system", "content": agent.system_prompt}
+            ]
+            msg_count = len(agent.messages)
+            print(f"  Context cleared. ({msg_count} system message kept)\n")
+            continue
+
+        if user_input == "/tools":
+            tool_names = sorted(registry._tools.keys())
+            print(f"\n\033[1;33m── {len(tool_names)} Tools ──\033[0m")
+            for name in tool_names:
+                entry = registry._tools[name]
+                print(f"  {name}: {entry.description[:70]}")
+            print()
+            continue
+
         if user_input == "/mem":
             print("\n\033[1;33m── Memory ──\033[0m")
             print(persistent.read_memory())
@@ -190,18 +294,21 @@ def main():
             continue
 
         if user_input == "/sessions":
-            # Quick session search
-            query = input("Search query: ").strip()
+            try:
+                query = session.prompt("Search query: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
             if query:
                 result = recall.recall(query)
                 print(result if result else "No results.\n")
             continue
 
         # Normal agent turn
-        print("\033[2m  thinking...\033[0m", end="", flush=True)
-        response = agent.run(user_input)
+        print("\033[2m  thinking... (ESC to cancel)\033[0m",
+              end="", flush=True)
+        response = _run_with_esc(agent, user_input)
         # Clear the "thinking..." line
-        print("\r" + " " * 40 + "\r", end="")
+        print("\r" + " " * 60 + "\r", end="")
 
         print(f"\033[1;36mhermes >\033[0m {response}\n")
 
